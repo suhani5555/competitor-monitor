@@ -102,9 +102,16 @@ def discover(base):
     return sorted(d.items(), key=lambda x: x[1], reverse=True)  # newest lastmod first
 
 
+STOP = {"a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "with", "is", "are", "how", "do", "you", "it", "at", "by"}
+
+
 def short_kw(t):
-    t = re.sub(r"^(how to|how do you|how can|what is|what are|why|the)\s+", "", t.lower()).strip(" ?:,.")
-    return " ".join(t.split()[:6])
+    t = re.split(r"[:,?]", t.lower())[0]
+    t = re.sub(r"^(how to|how do you|how can|what is|what are|why)\s+", "", t).strip()
+    w = t.split()[:8]
+    while w and w[-1] in STOP:
+        w.pop()
+    return " ".join(w)
 
 
 def parse(url):
@@ -142,12 +149,19 @@ def volume(kw):
     login, pw = os.environ.get("DFS_LOGIN"), os.environ.get("DFS_PASSWORD")
     if not login or not pw:
         return "n/a (no API key set)"
+    kw = re.sub(r"[^\w\s-]", " ", kw).strip()  # API rejects commas and symbols
+    if not kw:
+        return "n/a (no keyword)"
     try:
         r = requests.post("https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live",
                           auth=(login, pw), timeout=30,
                           json=[{"keywords": [kw], "location_code": 2840, "language_code": "en"}])
         if r.status_code in (401, 403):
-            return "n/a (invalid API credentials)"
+            try:
+                msg = r.json().get("status_message", "")
+            except ValueError:
+                msg = ""
+            return f"n/a (credentials rejected, HTTP {r.status_code}: {msg[:80]})"
         task = r.json()["tasks"][0]
         if task.get("status_code") != 20000:
             return f"n/a ({task.get('status_message')})"
