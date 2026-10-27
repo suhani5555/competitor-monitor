@@ -1,4 +1,4 @@
-import os, re, hashlib, sqlite3
+import os, re, html, hashlib, sqlite3
 from urllib.parse import urljoin, urlparse
 from concurrent.futures import ThreadPoolExecutor
 import requests
@@ -61,20 +61,22 @@ def sitemap_urls(base):
     except FetchError:
         pass
     queue += [base + "/sitemap.xml", base + "/sitemap_index.xml"]
-    while queue and len(seen) < 15:
+    while queue and len(seen) < 10 and len(found) < 5000:
         sm = queue.pop(0)
         if sm in seen:
             continue
         seen.add(sm)
         try:
-            soup = BeautifulSoup(get(sm).content, "xml")
+            text = get(sm).text
         except FetchError:
             continue
-        queue += [s.loc.text.strip() for s in soup.find_all("sitemap") if s.loc]
+        queue += [html.unescape(u) for u in re.findall(r"<sitemap>.*?<loc>\s*(.*?)\s*</loc>", text, re.S)]
         queue.sort(key=lambda s: not re.search("post|blog|article|news", s))
-        for u in soup.find_all("url"):
-            if u.loc:
-                found.append((u.loc.text.strip(), u.lastmod.text.strip() if u.lastmod else ""))
+        for blk in re.findall(r"<url>(.*?)</url>", text, re.S):  # light regex parsing, saves memory
+            loc = re.search(r"<loc>\s*(.*?)\s*</loc>", blk, re.S)
+            lm = re.search(r"<lastmod>\s*(.*?)\s*</lastmod>", blk, re.S)
+            if loc:
+                found.append((html.unescape(loc.group(1)), lm.group(1) if lm else ""))
     return found
 
 
@@ -145,31 +147,37 @@ def parse(url):
                 keyword=kw[:80])
 
 
-def volume(kw):
+def volumes(kws):
+    """One API request for ALL keywords of a run (cheaper). Returns {keyword: volume or message}."""
     login, pw = os.environ.get("DFS_LOGIN"), os.environ.get("DFS_PASSWORD")
+    clean = {k: " ".join(re.sub(r"[^\w\s-]", " ", k).lower().split()[:10]) for k in kws}
+    words = sorted({c for c in clean.values() if c})
+
+    def out(msg):
+        return {k: msg for k in kws}
+
     if not login or not pw:
-        return "n/a (no API key set)"
-    kw = re.sub(r"[^\w\s-]", " ", kw).strip()  # API rejects commas and symbols
-    if not kw:
-        return "n/a (no keyword)"
+        return out("n/a (no API key set)")
+    if not words:
+        return out("n/a (no keyword)")
     try:
-        r = requests.post("https://api.dataforseo.com/v3/keywords_data/google_ads/search_volume/live",
-                          auth=(login, pw), timeout=30,
-                          json=[{"keywords": [kw], "location_code": 2840, "language_code": "en"}])
+        host = "sandbox" if os.environ.get("DFS_SANDBOX") else "api"  # sandbox = free, dummy data
+        r = requests.post(f"https://{host}.dataforseo.com/v3/keywords_data/google_ads/search_volume/live",
+                          auth=(login, pw), timeout=60,
+                          json=[{"keywords": words, "location_code": 2840, "language_code": "en"}])
         if r.status_code in (401, 403):
             try:
                 msg = r.json().get("status_message", "")
             except ValueError:
                 msg = ""
-            return f"n/a (credentials rejected, HTTP {r.status_code}: {msg[:80]})"
+            return out(f"n/a (credentials rejected, HTTP {r.status_code}: {msg[:80]})")
         task = r.json()["tasks"][0]
         if task.get("status_code") != 20000:
-            return f"n/a ({task.get('status_message')})"
-        res = (task.get("result") or [{}])[0]
-        v = res.get("search_volume")
-        return v if v is not None else "n/a (no data)"
+            return out(f"n/a ({task.get('status_message')})")
+        found = {i.get("keyword"): i.get("search_volume") for i in (task.get("result") or [])}
+        return {k: (found[clean[k]] if found.get(clean[k]) is not None else "n/a (no data)") for k in kws}
     except Exception:
-        return "n/a (API error)"
+        return out("n/a (API error)")
 
 
 def check_pricing(base, c):
@@ -217,13 +225,14 @@ def run(domain):
     known = {r[0] for r in c.execute("SELECT url FROM posts WHERE domain=?", (base,))}
     fresh = [u for u, _ in cands if u not in known]
     top, rest = fresh[:MAX_NEW], fresh[MAX_NEW:]
-    with ThreadPoolExecutor(8) as ex:
+    with ThreadPoolExecutor(4) as ex:
         posts = [p for p in ex.map(parse, top) if p]
     dates = dict(cands)
+    vols = volumes([p["keyword"] for p in posts]) if posts else {}
     for p in posts:
         if not p["published"]:
             p["published"] = dates.get(p["url"], "")[:10]
-        p["volume"] = volume(p["keyword"])
+        p["volume"] = vols[p["keyword"]]
         c.execute("INSERT OR IGNORE INTO posts VALUES(?,?,?,?,?,?,?,datetime('now'))",
                   (p["url"], base, p["title"], p["published"], p["description"], p["keyword"], str(p["volume"])))
     for u in rest:  # remember older URLs so they are never reported as "new" later
